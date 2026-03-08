@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN
+      - AUTHORIZED_USERS
+      - CLAUDE_MODEL
+    volumes:
+      - claude-home:/root
+    env_file:
+      - .env
+
+volumes:
+  claude-home:

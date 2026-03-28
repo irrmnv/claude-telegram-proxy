@@ -1,6 +1,7 @@
 services:
   bot:
     build: .
+    container_name: claude-bot
     restart: unless-stopped
     environment:
       - TELEGRAM_BOT_TOKEN

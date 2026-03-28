@@ -1,13 +1,14 @@
 """Claude Telegram Proxy — a small bot that forwards messages to Claude via CLI."""
 
 import functools
-import io
 import json
 import logging
 import os
 import asyncio
+import itertools
 import subprocess
 import tempfile
+import time
 
 from telegram import Update
 from telegram.ext import (
@@ -20,6 +21,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -29,6 +31,11 @@ AUTHORIZED_USERS: set[int] = {
     if uid.strip()
 }
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "haiku")
+STREAM_EDIT_INTERVAL = 1.5  # seconds between Telegram message edits
+PONDERING_PHRASES = [
+    "Brewing...", "Pondering...", "Mulling it over...", "Cooking up a response...",
+    "Chewing on it...", "Percolating...", "Noodling on it...", "Simmering...",
+]
 
 # Per-user state
 user_models: dict[int, str] = {}
@@ -54,17 +61,23 @@ def authorized(fn):
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def download_bytes(file_obj) -> bytes:
-    buf = io.BytesIO()
-    await file_obj.download_to_memory(buf)
-    return buf.getvalue()
+async def _save_telegram_file(bot, file_id: str, suffix: str) -> str:
+    """Download a Telegram file to a temp file, return its path."""
+    file = await bot.get_file(file_id)
+    data = await file.download_as_bytearray()
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.write(data)
+    tmp.close()
+    return tmp.name
 
 
-def _run_claude(user_id: int, prompt: str) -> str:
-    """Run Claude CLI in a subprocess. Called from a thread via asyncio.to_thread."""
+def _stream_claude(user_id: int, prompt: str, queue: "asyncio.Queue[dict | None]",
+                   loop: asyncio.AbstractEventLoop) -> None:
+    """Run Claude CLI with stream-json output, pushing events to the queue."""
     model = user_models.get(user_id, DEFAULT_MODEL)
     session_id = user_sessions.get(user_id)
-    cmd = ["claude", "-p", "--output-format", "json", "--model", model,
+    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
+           "--include-partial-messages", "--model", model,
            "--allowedTools", "WebSearch,WebFetch,Read",
            "--append-system-prompt",
            "You are a general-purpose assistant in a Telegram chat. "
@@ -79,65 +92,154 @@ def _run_claude(user_id: int, prompt: str) -> str:
     )
     active_processes[user_id] = proc
 
+    # Send prompt and close stdin so the CLI starts processing
+    proc.stdin.write(prompt)
+    proc.stdin.close()
+
+    put = lambda ev: asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
+
     try:
-        stdout, stderr = proc.communicate(input=prompt, timeout=300)
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            put(event)
+
+        proc.wait(timeout=300)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        return "Request timed out."
+        put({"type": "error", "error": "Request timed out."})
     finally:
         active_processes.pop(user_id, None)
 
     if proc.returncode in (-9, -15):
-        return "Request cancelled."
-
-    if proc.returncode != 0:
-        err = stderr.strip() or stdout.strip()
+        put({"type": "error", "error": "Request cancelled."})
+    elif proc.returncode != 0:
+        stderr = proc.stderr.read().strip()
+        err = stderr or "Unknown error"
         log.error("Claude CLI error (rc=%d): %s", proc.returncode, err)
-        return f"Error from Claude CLI:\n{err[:500]}"
+        put({"type": "error", "error": f"Error from Claude CLI:\n{err[:500]}"})
 
-    try:
-        output = json.loads(stdout)
-    except json.JSONDecodeError:
-        return stdout.strip() or "No response from Claude."
-
-    if "session_id" in output:
-        user_sessions[user_id] = output["session_id"]
-
-    return output.get("result", stdout.strip())
+    put(None)  # sentinel — always last
 
 
 def _get_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in user_locks:
-        user_locks[user_id] = asyncio.Lock()
-    return user_locks[user_id]
-
-
-async def send_to_claude(user_id: int, text: str, media_files: list[str] | None = None) -> str:
-    prompt_parts = []
-    if media_files:
-        for path in media_files:
-            prompt_parts.append(f"[Attached file: {path}]")
-    if text:
-        prompt_parts.append(text)
-
-    prompt = "\n".join(prompt_parts) if prompt_parts else "(empty message)"
-    async with _get_lock(user_id):
-        return await asyncio.to_thread(_run_claude, user_id, prompt)
+    return user_locks.setdefault(user_id, asyncio.Lock())
 
 
 # ---------------------------------------------------------------------------
-# Telegram reply
+# Telegram reply — streaming edition
 # ---------------------------------------------------------------------------
 
-async def send_reply(update: Update, text: str) -> None:
-    max_len = 4096
-    while text:
-        chunk, text = text[:max_len], text[max_len:]
+async def _try_edit(msg, text: str) -> None:
+    """Edit a message, trying Markdown first, falling back to plain text."""
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
         try:
-            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            await msg.edit_text(text)
         except Exception:
-            await update.message.reply_text(chunk)
+            log.debug("edit_text failed", exc_info=True)
+
+
+async def _send_final(msg, chat_id: int, text: str, bot) -> None:
+    """Send the final text. If it exceeds 4096 chars, split into multiple messages."""
+    max_len = 4096
+    # Edit the existing message with the first chunk
+    first, rest = text[:max_len], text[max_len:]
+    await _try_edit(msg, first)
+    # Send remaining chunks as new messages
+    while rest:
+        chunk, rest = rest[:max_len], rest[max_len:]
+        try:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=chunk)
+
+
+async def _iter_events(queue: asyncio.Queue):
+    """Yield events from the queue until sentinel (None) or timeout."""
+    while True:
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=300)
+        except asyncio.TimeoutError:
+            yield {"type": "error", "error": "Request timed out."}
+            return
+        if event is None:
+            return
+        yield event
+
+
+async def stream_to_telegram(user_id: int, prompt: str, chat_id: int, bot,
+                              reply_to_message_id: int) -> None:
+    """Stream Claude's response, progressively editing a Telegram message."""
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    thread_task = loop.run_in_executor(None, _stream_claude, user_id, prompt, queue, loop)
+
+    msg = await bot.send_message(
+        chat_id=chat_id, text="...", reply_to_message_id=reply_to_message_id
+    )
+
+    streaming = ""
+    final = ""
+    error_text = None
+    thinking = False
+    pondering = itertools.cycle(PONDERING_PHRASES)
+    last_edit = 0.0
+
+    async for event in _iter_events(queue):
+        etype = event.get("type", "")
+
+        if etype == "error":
+            error_text = event["error"]
+            break
+
+        if etype == "stream_event":
+            inner = event.get("event", {})
+            inner_type = inner.get("type", "")
+
+            if inner_type == "content_block_start":
+                block = inner.get("content_block", {})
+                if block.get("type") == "thinking":
+                    thinking = True
+                elif block.get("type") == "text":
+                    thinking = False
+
+            elif inner_type == "content_block_delta":
+                delta = inner.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    streaming += delta.get("text", "")
+
+        elif etype == "result":
+            sid = event.get("session_id")
+            if sid:
+                user_sessions[user_id] = sid
+            final = event.get("result", "")
+
+        now = time.monotonic()
+        if now - last_edit >= STREAM_EDIT_INTERVAL:
+            if streaming:
+                await _try_edit(msg, streaming[:4090] + " ▍")
+                last_edit = now
+            elif thinking:
+                await _try_edit(msg, next(pondering))
+                last_edit = now
+
+    await thread_task
+
+    text = final or streaming
+    if error_text:
+        await _try_edit(msg, error_text)
+    elif text:
+        await _send_final(msg, chat_id, text, bot)
+    else:
+        await _try_edit(msg, "No response from Claude.")
 
 
 # ---------------------------------------------------------------------------
@@ -202,39 +304,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = message.text or message.caption or None
     media_files: list[str] = []
-    temp_files: list[str] = []
 
     try:
         if message.photo:
-            photo = message.photo[-1]
-            file = await context.bot.get_file(photo.file_id)
-            img_bytes = await download_bytes(file)
-            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-            tmp.write(img_bytes)
-            tmp.close()
-            media_files.append(tmp.name)
-            temp_files.append(tmp.name)
+            media_files.append(
+                await _save_telegram_file(context.bot, message.photo[-1].file_id, ".jpg"))
 
         if message.document and message.document.mime_type:
             mime = message.document.mime_type
             if mime.startswith("image/") or mime == "application/pdf":
                 ext = ".pdf" if mime == "application/pdf" else f".{mime.split('/')[-1]}"
-                file = await context.bot.get_file(message.document.file_id)
-                doc_bytes = await download_bytes(file)
-                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-                tmp.write(doc_bytes)
-                tmp.close()
-                media_files.append(tmp.name)
-                temp_files.append(tmp.name)
+                media_files.append(
+                    await _save_telegram_file(context.bot, message.document.file_id, ext))
 
         if not text and not media_files:
             return
 
+        prompt_parts = [f"[Attached file: {p}]" for p in media_files]
+        if text:
+            prompt_parts.append(text)
+
         await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
-        reply = await send_to_claude(user_id, text or "", media_files)
-        await send_reply(update, reply)
+        async with _get_lock(user_id):
+            await stream_to_telegram(
+                user_id, "\n".join(prompt_parts), message.chat_id, context.bot, message.message_id
+            )
     finally:
-        for f in temp_files:
+        for f in media_files:
             try:
                 os.unlink(f)
             except OSError:

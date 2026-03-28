@@ -29,9 +29,9 @@ A `/whoami` command is available to all users — it logs the sender's user ID, 
 
 Instead of using the paid Anthropic API directly, the proxy uses **Claude Code CLI** (`claude`) as its backend. This leverages a Claude Pro subscription, which includes CLI access, avoiding the need for a separate API key.
 
-Messages are sent to Claude by invoking the CLI in print mode (`claude -p --output-format json`). The JSON response is parsed to extract the reply text and session ID. The CLI is given access to `WebSearch`, `WebFetch`, and `Read` tools via `--allowedTools`. An `--append-system-prompt` flag overrides the CLI's default coding-focused persona, instructing it to act as a general-purpose assistant.
+Messages are sent to Claude by invoking the CLI in print mode with streaming output (`claude -p --output-format stream-json`). The CLI emits newline-delimited JSON events which are parsed in real time to extract text deltas and the session ID. The CLI is given access to `WebSearch`, `WebFetch`, and `Read` tools via `--allowedTools`. An `--append-system-prompt` flag overrides the CLI's default coding-focused persona, instructing it to act as a general-purpose assistant.
 
-The CLI runs in a background thread (`asyncio.to_thread`) so the bot can process other commands concurrently — in particular, the `/stop` command.
+The CLI runs in a background thread that pushes stream events into an `asyncio.Queue`. An async consumer reads the queue and progressively edits a Telegram message with the accumulated response text, throttled to ~1.5 seconds between edits to respect Telegram's rate limits. A cursor character (▍) is shown during streaming and removed on completion. This gives users immediate visual feedback as the response is generated.
 
 #### Model Selection
 

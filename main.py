@@ -341,8 +341,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled error: %s", context.error, exc_info=context.error)
+    from telegram.error import NetworkError, TimedOut
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        log.error("Network error — exiting so Docker can restart the container.")
+        os._exit(1)
+
+
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
+    app.add_error_handler(handle_error)
 
     app.add_handler(CommandHandler("whoami", handle_whoami))
     app.add_handler(CommandHandler("start", handle_start))

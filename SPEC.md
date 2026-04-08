@@ -54,3 +54,7 @@ The project is containerized with Docker. The Dockerfile installs Python, Node.j
 The Claude CLI must be authenticated inside the container on first run via `docker exec -it claude-bot claude login`.
 
 Environment variables (`TELEGRAM_BOT_TOKEN`, `AUTHORIZED_USERS`) are provided via a `.env` file.
+
+### Error Handling and Resilience
+
+An error handler is registered with the application. On network errors (`NetworkError`, `TimedOut`), the process exits with code 1 via `os._exit(1)`, allowing Docker's `restart: unless-stopped` policy to bring the container back up automatically.

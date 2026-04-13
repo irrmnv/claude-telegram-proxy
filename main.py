@@ -343,7 +343,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Unhandled error: %s", context.error, exc_info=context.error)
-    from telegram.error import NetworkError, TimedOut
+    from telegram.error import Conflict, NetworkError, TimedOut
+    if isinstance(context.error, Conflict):
+        return  # another instance is starting up; it will resolve on its own
     if isinstance(context.error, (NetworkError, TimedOut)):
         log.error("Network error — exiting so Docker can restart the container.")
         os._exit(1)
